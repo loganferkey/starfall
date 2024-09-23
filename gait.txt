@@ -1,0 +1,190 @@
+--@name lib/gait
+--@author galaxy
+--@server
+--@model models/maxofs2d/cube_tool.mdl
+
+    local gait = class("gait")
+    local realtime, math = timer.realtime, math
+    
+    -- technically a singleton
+    function gait:init(s)
+        
+        -- most of the stuff you can change is commented, hopefully it makes sense
+        -- the easiest way to change settings is to put it inside your animate() function like the example at the bottom
+        -- or alternatively you can call gait:updateSettings(settings) just make sure you dont call it in a loop
+        self.duration = s and s.duration or 1 -- in seconds how long it would take for all feet to step
+        -- if you have feet that move in pairs, so 4 with 2 steps each at a time, do 1/2
+        -- if you have 4 feet that move individually do 1/4, hopefully that makes sense
+        self.stance = s and s.stance or 1/2
+        self.leg_length = s and s.leg_length or 9999 -- how long the leg length is (important for when to hover leg in the air or take a step)
+        self.distance = s and s.take_step or 5 -- distance to take a step
+        self.min_height = s and s.min_height or 5 -- minimum height the foot will be in the air when stepping
+        self.max_height = s and s.max_height or 65 -- maximum height the foot will be in the air when stepping, relative to start/end of step
+        self.easing = s and s.easing or math.easeInOutCubic -- easing on step bezier, easeInOutCubic looks the best in my opinion
+        self.damping = s and s.damping or Vector(3,3,3) -- how much to divide velocity when adding to new step
+        -- table of step sounds to be played when stepping, important it's indexed in order as they're randomly selected
+        self.step_sounds = s and s.step_sounds or 
+        { 
+            "npc/vort/vort_foot1.wav",
+            "npc/vort/vort_foot2.wav",
+            "npc/vort/vort_foot3.wav",
+            "npc/vort/vort_foot4.wav"
+        }
+        self.base = s and s.base or chip() -- where the feet are centered on
+        self.always_down = s and s.down or true -- basically should the legs move relative to the base or always be pointing down
+        self.feet = self.feet or {} -- table that holds feet when added
+        
+        -- this is to make sure it works regardless of chip interval/tickrate
+        self.dt = 0
+        self.ct = 0
+        self.cycle = 0
+        
+        -- if i wanna change the trace for the foot this makes it easier
+        self.ft = function(foot, offset)
+            offset = offset or Vector()
+            return trace.line(self.base:localToWorld(foot.offset),
+                              self.always_down and self.base:localToWorld(foot.offset+offset)-Vector(0,0,self.leg_length*2) or
+                              self.base:localToWorld(foot.offset-Vector(0,0,self.leg_length*2)+offset), self.base)
+        end
+        
+        self.ready = true -- true after hitting init function
+        
+    end
+    
+    -- tough luck if you need to dynamically add/remove feet :D
+    function gait:foot(order, offset, ent, move)
+        if not self.ready then self:init() end
+        self.feet[#self.feet+1] = 
+        {
+            order = order or 0.5,
+            offset = offset or Vector(),
+            ent = ent or throw("gait:foot(order,offset,ent,move) you must supply an entity for the foot, hologram or prop!"),
+            ratio = 0,
+            move = move or false
+        }
+        return self.feet[#self.feet]
+    end
+    
+    function gait:reset_feet()
+        for _, foot in ipairs(self.feet) do
+            local tr = self.ft(foot)
+            foot.previous = tr.HitPos
+            foot.real = tr.HitPos
+            foot.mode = "check"
+            foot.ent:setPos(tr.HitPos)
+        end
+        self.reset = true
+    end
+    
+    -- you can still manually change values on the gait however an initial settings update works better than having to check properties in this file
+    function gait:update(s)
+        if s then
+            self:init(s) -- pass the settings from the animation method to init to be updated
+        end
+        self.updated = true
+    end
+    
+    function gait:get_delta()
+        -- store deltatime of last chip execution to current
+        self.dt = self.ct == 0 and 0 or math.round(realtime() - self.ct, 4)
+        self.ct = realtime()
+    end
+    
+    -- just call this in a loop, see example at the bottom
+    function gait:animate(settings)
+    
+        -- everything after this should technically never error/hit nil values
+        if not self.ready then throw("Add feet first with gait:foot(order,offset)") end
+        if not self.reset then self:reset_feet() end
+        if not self.updated then self:update(settings) end
+        
+        self:get_delta()
+        
+        for _, foot in ipairs(self.feet) do
+        
+            if foot.mode == "check" and math.abs(foot.order*self.duration - self.cycle) < self.dt then
+            
+                local check = self.ft(foot)
+                if check.Hit and check.HitPos:getDistance(foot.real) > self.distance then
+                    foot.previous = foot.real
+                    foot.mode = "step"
+                end
+            
+            elseif foot.mode == "step" then
+            
+                foot.ratio = math.min(foot.ratio + self.dt * ((1 / self.stance) / self.duration), 1)
+                local final = self.ft(foot, self.base:getLocalVelocity()/self.damping).HitPos
+                local middle = (final + foot.previous) / 2 + self.base:getUp() * math.clamp(final:getDistance(foot.previous)*0.66, self.min_height, self.max_height)
+                foot.real = math.bezierVector(self.easing(foot.ratio), foot.previous, middle, final)
+                
+                if foot.ratio >= 1 then
+                    foot.ratio = 0
+                    foot.mode = "check"
+                    foot.real = final
+                    foot.ent:emitSound(self.step_sounds[math.round(math.random(1,#self.step_sounds))], 90, 100, 3, CHAN_AUTO)
+                end
+                if foot.move then foot.ent:setPos(foot.real) end
+            
+            end
+        
+        end
+        
+        self.cycle = self.cycle >= self.duration and 0 or math.min(self.cycle + self.dt, self.duration)
+    
+    end
+    
+    --[[
+    example implementation
+    :imagine this in another file
+    
+    --name your mech chip
+    --server
+    --include lib/gait.txt
+    
+    local gait = require("lib/gait.txt")
+    
+    local foot1 = gait:foot(0.25, Vector(35,35,0), hologram.create(Vector(), Angle(), "models/hunter/misc/sphere025x025.mdl", Vector(1)), true)
+    local foot2 = gait:foot(0.75, Vector(35,-35,0), hologram.create(Vector(), Angle(), "models/hunter/misc/sphere025x025.mdl", Vector(1)), true)
+    local foot3 = gait:foot(0.75, Vector(-35,35,0), hologram.create(Vector(), Angle(), "models/hunter/misc/sphere025x025.mdl", Vector(1)), true)
+    local foot4 = gait:foot(0.25, Vector(-35,-35,0), hologram.create(Vector(), Angle(), "models/hunter/misc/sphere025x025.mdl", Vector(1)), true)
+    
+    hook.add("think", "", function()
+    -- alternatively for performance you can do timer.create("interval", 0.06, 0, function()
+        gait:animate({ duration = 1, stance = 1/2 })
+    end)
+    
+    ]]--
+    
+    return gait
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
